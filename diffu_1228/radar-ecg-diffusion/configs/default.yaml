@@ -1,0 +1,30 @@
+model:
+  name: ConditionalUNet
+  input_channels: 2
+  output_channels: 1
+  time_embedding_dim: 256
+
+training:
+  epochs: 50
+  batch_size: 32
+  learning_rate: 0.0002
+  weight_decay: 0.01
+
+data:
+  dataset_path: "dataset_128_0113.npz"
+  standardize: true
+  segment_length: 128
+
+scheduler:
+  steps: 1000
+  beta_start: 0.0001
+  beta_end: 0.02
+
+inference:
+  ddim_steps: 20
+  eta: 0.0
+
+evaluation:
+  metrics:
+    - correlation_coefficient
+    - mean_squared_error
