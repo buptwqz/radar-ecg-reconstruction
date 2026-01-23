@@ -37,30 +37,27 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import QObject, QThread, pyqtSlot, pyqtSignal, Qt
 import pyqtgraph as pg
 
+from vitals_common import (
+    MAGIC_WORD,
+    LENGTH_MAGIC_WORD,
+    RadarConfig,
+    HttpSenderThread,
+    parse_frame_bytes,
+    IDX_PHASE,
+    IDX_BREATH_WAVE,
+    IDX_HEART_WAVE,
+    IDX_HEART_RATE_FFT,
+    IDX_HEART_RATE_PEAK,
+    IDX_BREATH_RATE_FFT,
+    IDX_CONF_BREATH,
+    IDX_CONF_HEART,
+    IDX_ENERGY_BREATH,
+    IDX_MOTION,
+)
+
 
 # --- 全局常量（雷达协议） ---
-MAGIC_WORD = b"\x02\x01\x04\x03\x06\x05\x08\x07"
-LENGTH_MAGIC_WORD = 8
-LENGTH_HEADER = 40
-LENGTH_TLV_HEADER = 8
-LENGTH_DEBUG_DATA = 128
-MMWDEMO_SEGMENT_LEN = 32
-
-# 帧结构（按字节偏移读取，和 MATLAB Demo 的读取方式一致）：
-# [Header 40B] [TLV Header 8B] [DebugData 128B] [TLV Header 8B] [RangeProfile 4*N] [Padding]
-# DebugData = 32 * float32（stats），下方 IDX_* 为关键字段索引。
-
-# 数据索引
-IDX_PHASE = 4
-IDX_BREATH_WAVE = 5
-IDX_HEART_WAVE = 6
-IDX_HEART_RATE_FFT = 7
-IDX_HEART_RATE_PEAK = 10
-IDX_BREATH_RATE_FFT = 11
-IDX_CONF_BREATH = 14
-IDX_CONF_HEART = 16
-IDX_ENERGY_BREATH = 19
-IDX_MOTION = 21
+# MAGIC_WORD/LENGTH_* 以及 IDX_* 已迁移到 vitals_common.py
 
 
 # 模型输入长度（与你的 128 点模型一致）
@@ -92,144 +89,8 @@ class VitalSignsPayload:
         return asdict(self)
 
 
-class DataSenderThread(QThread):
-    """HTTP发送线程 - 按20Hz速率逐点发送队列中的数据"""
-
-    send_progress = pyqtSignal(int, int)  # sent_in_batch, queue_remaining
-
-    def __init__(self, url: str, rate_hz: float = 20.0):
-        super().__init__()
-        self.url = url
-        self.data_queue: Queue[VitalSignsPayload] = Queue(maxsize=4096)
-        self.running = True
-        self.send_interval = 1.0 / float(rate_hz)
-        self.batch_sent_count = 0
-
-    def add_batch(self, payloads: list[VitalSignsPayload]) -> None:
-        self.batch_sent_count = 0
-        for p in payloads:
-            if not self.data_queue.full():
-                self.data_queue.put(p)
-
-    def get_log_time(self) -> str:
-        return datetime.now().strftime("%H:%M:%S.%f")[:-3]
-
-    def run(self) -> None:
-        approx_sec = MODEL_INPUT_LENGTH / 20.0
-        print(
-            f"[{self.get_log_time()}] [SYSTEM] HTTP sender @ 20Hz (50ms/点, {MODEL_INPUT_LENGTH}点≈{approx_sec:.1f}秒)"
-        )
-        print(f"[{self.get_log_time()}] [SYSTEM] 目标: {self.url}")
-
-        last_send_time = 0.0
-        total_sent = 0
-
-        while self.running:
-            try:
-                payload = self.data_queue.get(timeout=0.1)
-            except Empty:
-                continue
-
-            now = time.time()
-            elapsed = now - last_send_time
-            if elapsed < self.send_interval:
-                time.sleep(self.send_interval - elapsed)
-
-            headers = {"Content-Type": "application/json"}
-            try:
-                start_ts = time.time()
-                response = requests.post(self.url, json=payload.to_json_dict(), headers=headers, timeout=1.0)
-                last_send_time = time.time()
-                latency_ms = (last_send_time - start_ts) * 1000.0
-
-                total_sent += 1
-                self.batch_sent_count += 1
-                queue_size = self.data_queue.qsize()
-                self.send_progress.emit(self.batch_sent_count, queue_size)
-
-                if response.status_code != 200:
-                    print(
-                        f"[{self.get_log_time()}] [HTTP FAIL] {response.status_code} -> {response.text[:64]}"
-                    )
-                else:
-                    # 简要日志
-                    print(
-                        f"[{self.get_log_time()}] [HTTP] #{total_sent} | "
-                        f"BR:{payload.breathRate} HR:{payload.heartRate} | "
-                        f"ECG:{payload.ecgValue:.4f} B:{payload.breathWavePoint:.4f} H:{payload.heartWavePoint:.4f} | "
-                        f"{latency_ms:.0f}ms"
-                    )
-            except requests.exceptions.Timeout:
-                print(f"[{self.get_log_time()}] [HTTP ERROR] timeout")
-            except requests.exceptions.ConnectionError:
-                print(f"[{self.get_log_time()}] [HTTP ERROR] connection failed")
-            except Exception as exc:  # noqa: BLE001
-                print(f"[{self.get_log_time()}] [HTTP ERROR] {exc}")
-
-    def stop(self) -> None:
-        self.running = False
-        self.wait()
-
-
-class RadarConfig:
-    def __init__(self, cfg_path: str):
-        self.valid = False
-        self.numRangeBinProcessed = 0
-        self.rangeStartMeters = 0.2
-        self.rangeEndMeters = 1.0
-        self.rangeAxis = np.array([])
-        self.payload_size = 0
-        self.parse(cfg_path)
-
-    def parse(self, cfg_path: str) -> None:
-        try:
-            with open(cfg_path, "r") as f:
-                lines = f.readlines()
-
-            adc_samples = 256
-            dig_out_rate = 2500
-            freq_slope = 60
-
-            for line in lines:
-                parts = line.strip().split()
-                if not parts:
-                    continue
-                if parts[0] == "profileCfg":
-                    freq_slope = float(parts[8])
-                    adc_samples = int(parts[10])
-                    dig_out_rate = int(parts[11])
-                elif parts[0] == "vitalSignsCfg":
-                    self.rangeStartMeters = float(parts[1])
-                    self.rangeEndMeters = float(parts[2])
-
-            num_range_bins = 1
-            while num_range_bins < adc_samples:
-                num_range_bins *= 2
-
-            range_max = (3e8 * dig_out_rate * 1e3) / (2 * freq_slope * 1e12)
-            range_bin_size = range_max / num_range_bins
-
-            start_idx = int(self.rangeStartMeters / range_bin_size)
-            end_idx = int(self.rangeEndMeters / range_bin_size)
-            self.numRangeBinProcessed = end_idx - start_idx + 1
-            self.rangeAxis = np.arange(start_idx, end_idx + 1) * range_bin_size
-
-            total = (
-                LENGTH_HEADER
-                + LENGTH_TLV_HEADER
-                + LENGTH_DEBUG_DATA
-                + LENGTH_TLV_HEADER
-                + (4 * self.numRangeBinProcessed)
-            )
-            remainder = total % MMWDEMO_SEGMENT_LEN
-            if remainder != 0:
-                total += MMWDEMO_SEGMENT_LEN - remainder
-
-            self.payload_size = int(total)
-            self.valid = True
-            print(f"Config: RangeBins={self.numRangeBinProcessed}, PayloadSize={self.payload_size}")
-        except Exception as e:
-            print(f"Config Error: {e}")
+# 统一复用公共发送线程实现（支持 add_batch + 20Hz 发送）
+DataSenderThread = HttpSenderThread
 
 
 class RadarThread(QThread):
@@ -328,21 +189,7 @@ class RadarThread(QThread):
 
     def parse_frame(self, data: bytes) -> dict:
         """解析单帧数据，返回 stats 与 range_profile。"""
-        ptr = LENGTH_HEADER + LENGTH_TLV_HEADER
-        stats_data = data[ptr : ptr + LENGTH_DEBUG_DATA]
-        stats = struct.unpack(f"<{LENGTH_DEBUG_DATA // 4}f", stats_data)
-
-        ptr += LENGTH_DEBUG_DATA
-        ptr += LENGTH_TLV_HEADER
-
-        rp_len = 4 * self.cfg.numRangeBinProcessed
-        rp_data = data[ptr : ptr + rp_len]
-        rp_raw = np.frombuffer(rp_data, dtype=np.int16)
-        rp_real = rp_raw[0::2].astype(np.float64)
-        rp_imag = rp_raw[1::2].astype(np.float64)
-        rp_abs = np.sqrt(rp_real**2 + rp_imag**2)
-
-        return {"stats": stats, "range_profile": rp_abs}
+        return parse_frame_bytes(data, self.cfg)
 
     def stop(self) -> None:
         self.running = False
@@ -776,7 +623,12 @@ def main() -> int:
         print("[ERROR] Failed to load ECG model")
         return 1
 
-    sender_thread = DataSenderThread(args.backend_url)
+    sender_thread = DataSenderThread(
+        args.backend_url,
+        queue_maxsize=4096,
+        rate_hz=20.0,
+        request_timeout=1.0,
+    )
     sender_thread.start()
 
     inference_thread = InferenceThread(reconstructor)

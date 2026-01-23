@@ -12,7 +12,6 @@
 import sys
 import os
 import time
-import struct
 import numpy as np
 import serial
 import requests
@@ -22,6 +21,25 @@ from queue import Queue, Empty
 from collections import deque
 from dataclasses import dataclass, asdict
 from datetime import datetime
+
+from vitals_common import (
+    MAGIC_WORD,
+    LENGTH_MAGIC_WORD,
+    RadarConfig,
+    HttpSenderThread,
+    parse_frame_bytes,
+    IDX_PHASE,
+    IDX_BREATH_WAVE,
+    IDX_HEART_WAVE,
+    IDX_HEART_RATE_FFT,
+    IDX_HEART_RATE_PEAK,
+    IDX_BREATH_RATE_FFT,
+    IDX_CONF_BREATH,
+    IDX_CONF_HEART,
+    IDX_ENERGY_BREATH,
+    IDX_ENERGY_HEART,
+    IDX_MOTION,
+)
 
 # 添加项目路径以导入本地模块（避免从别的工作目录启动时 import 失败）
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -39,13 +57,6 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 from PyQt6.QtCore import QThread, pyqtSignal, QTimer, Qt
 import pyqtgraph as pg
 
-# --- 全局常量 ---
-MAGIC_WORD = b'\x02\x01\x04\x03\x06\x05\x08\x07'
-LENGTH_MAGIC_WORD = 8
-LENGTH_HEADER = 40
-LENGTH_TLV_HEADER = 8
-LENGTH_DEBUG_DATA = 128
-MMWDEMO_SEGMENT_LEN = 32
 PLOT_DISPLAY_LENGTH = 128
 
 # 解析说明：
@@ -55,20 +66,6 @@ PLOT_DISPLAY_LENGTH = 128
 # --- 后端配置 ---
 BACKEND_URL = "http://10.29.211.136:8080/api/ti6843/vital/data/data"
 DEVICE_ID = "TI1443_01"
-
-# 数据索引
-IDX_PHASE = 4
-IDX_BREATH_WAVE = 5
-IDX_HEART_WAVE = 6
-IDX_HEART_RATE_FFT = 7
-IDX_HEART_RATE_PEAK = 10
-IDX_BREATH_RATE_FFT = 11
-IDX_CONF_BREATH = 14
-IDX_CONF_HEART = 16
-IDX_ENERGY_BREATH = 19
-IDX_ENERGY_HEART = 20
-IDX_MOTION = 21
-
 
 @dataclass
 class VitalSignsPayload:
@@ -88,113 +85,7 @@ class VitalSignsPayload:
         return asdict(self)
 
 
-class DataSenderThread(QThread):
-    def __init__(self, url):
-        super().__init__()
-        self.url = url
-        self.data_queue = Queue(maxsize=10)
-        self.running = True
-
-    def add_data(self, payload: VitalSignsPayload):
-        if not self.data_queue.full():
-            self.data_queue.put(payload)
-
-    def get_log_time(self):
-        return datetime.now().strftime("%H:%M:%S.%f")[:-3]
-
-    def run(self):
-        print(f"[{self.get_log_time()}] [SYSTEM] HTTP 发送线程启动 -> 目标: {self.url}")
-
-        while self.running:
-            try:
-                payload_obj = self.data_queue.get(timeout=1.0)
-
-                json_data = payload_obj.to_json_dict()
-                headers = {'Content-Type': 'application/json'}
-
-                try:
-                    start_ts = time.time()
-                    response = requests.post(
-                        self.url,
-                        json=json_data,
-                        headers=headers,
-                        timeout=0.5
-                    )
-                    cost_time = (time.time() - start_ts) * 1000
-
-                    if response.status_code == 200:
-                        print(f"[{self.get_log_time()}] [HTTP SUCCESS] ✅ 耗时:{cost_time:.0f}ms | Code:200 | "
-                              f"HR:{payload_obj.heartRate} BR:{payload_obj.breathRate} "
-                              f"Wave(H/B/ECG):{payload_obj.heartWavePoint}/{payload_obj.breathWavePoint}/{getattr(payload_obj, 'ecgWavePoint', 0.0)}")
-                    else:
-                        print(f"[{self.get_log_time()}] [HTTP FAIL] ❌ 服务器返回: {response.status_code} | "
-                              f"响应: {response.text[:50]}")
-
-                except requests.exceptions.Timeout:
-                    print(f"[{self.get_log_time()}] [HTTP ERROR] ⏳ 请求超时")
-                except requests.exceptions.ConnectionError:
-                    print(f"[{self.get_log_time()}] [HTTP ERROR] 🔌 连接失败")
-                except Exception as e:
-                    print(f"[{self.get_log_time()}] [HTTP ERROR] ⚠️ 未知错误: {e}")
-
-            except Empty:
-                continue
-            except Exception as e:
-                print(f"[{self.get_log_time()}] [THREAD ERROR] {e}")
-
-    def stop(self):
-        self.running = False
-        self.wait()
-
-
-class RadarConfig:
-    def __init__(self, cfg_path):
-        self.valid = False
-        self.numRangeBinProcessed = 0
-        self.rangeStartMeters = 0.2
-        self.rangeEndMeters = 1.0
-        self.rangeAxis = np.array([])
-        self.payload_size = 0
-        self.parse(cfg_path)
-
-    def parse(self, cfg_path):
-        try:
-            with open(cfg_path, 'r') as f:
-                lines = f.readlines()
-            adc_samples = 256
-            dig_out_rate = 2500
-            freq_slope = 60
-            start_freq = 77
-            for line in lines:
-                parts = line.strip().split()
-                if not parts: continue
-                if parts[0] == 'profileCfg':
-                    start_freq = float(parts[2])
-                    freq_slope = float(parts[8])
-                    adc_samples = int(parts[10])
-                    dig_out_rate = int(parts[11])
-                elif parts[0] == 'vitalSignsCfg':
-                    self.rangeStartMeters = float(parts[1])
-                    self.rangeEndMeters = float(parts[2])
-            num_range_bins = 1
-            while num_range_bins < adc_samples:
-                num_range_bins *= 2
-            range_max = (3e8 * dig_out_rate * 1e3) / (2 * freq_slope * 1e12)
-            range_bin_size = range_max / num_range_bins
-            start_idx = int(self.rangeStartMeters / range_bin_size)
-            end_idx = int(self.rangeEndMeters / range_bin_size)
-            self.numRangeBinProcessed = end_idx - start_idx + 1
-            self.rangeAxis = np.arange(start_idx, end_idx + 1) * range_bin_size
-            total = LENGTH_HEADER + LENGTH_TLV_HEADER + LENGTH_DEBUG_DATA + \
-                    LENGTH_TLV_HEADER + (4 * self.numRangeBinProcessed)
-            remainder = total % MMWDEMO_SEGMENT_LEN
-            if remainder != 0:
-                total += (MMWDEMO_SEGMENT_LEN - remainder)
-            self.payload_size = int(total)
-            self.valid = True
-            print(f"Config: RangeBins={self.numRangeBinProcessed}, PayloadSize={self.payload_size}")
-        except Exception as e:
-            print(f"Config Error: {e}")
+DataSenderThread = HttpSenderThread
 
 
 class RadarThread(QThread):
@@ -284,21 +175,7 @@ class RadarThread(QThread):
 
     def parse_frame(self, data):
         """解析单帧二进制数据（UDP 接收版本）。"""
-        ptr = LENGTH_HEADER + LENGTH_TLV_HEADER  # 48
-        stats_data = data[ptr: ptr + LENGTH_DEBUG_DATA]
-        stats = struct.unpack(f'<{LENGTH_DEBUG_DATA // 4}f', stats_data)
-
-        ptr += LENGTH_DEBUG_DATA
-        ptr += LENGTH_TLV_HEADER
-        
-        rp_len = 4 * self.cfg.numRangeBinProcessed
-        rp_data = data[ptr: ptr + rp_len]
-        rp_raw = np.frombuffer(rp_data, dtype=np.int16)
-        rp_real = rp_raw[0::2].astype(np.float64)
-        rp_imag = rp_raw[1::2].astype(np.float64)
-        rp_abs = np.sqrt(rp_real ** 2 + rp_imag ** 2)
-        
-        return {'stats': stats, 'range_profile': rp_abs}
+        return parse_frame_bytes(data, self.cfg)
 
     def stop(self):
         self.running = False
@@ -339,7 +216,7 @@ class VitalSignsGUI(QMainWindow):
         self.prev_heart_val = 0.0
         self.dataPlotThresh = 50.0
 
-        self.sender_thread = DataSenderThread(BACKEND_URL)
+        self.sender_thread = DataSenderThread(BACKEND_URL, queue_maxsize=10)
         self.sender_thread.start()
         self.thread = RadarThread(data_port, cli_port, self.cfg, cfg_path)
         self.thread.packet_received.connect(self.update_data)

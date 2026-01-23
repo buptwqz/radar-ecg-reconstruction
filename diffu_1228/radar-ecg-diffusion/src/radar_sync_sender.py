@@ -1,21 +1,27 @@
-"""IWR1443 生命体征(串口) + HTTP 上报（GUI版）
-
-- 从雷达 data 串口读取帧并解析。
-- GUI 显示生命体征波形。
-- 将当前呼吸/心跳等信息逐点通过 HTTP POST 上报后端。
-"""
-
 import sys
+import os
 import time
 import numpy as np
 import serial
 import requests
 import json
 from queue import Queue, Empty
+from collections import deque
 from dataclasses import dataclass, asdict
 from datetime import datetime
 
-from vitals_common import (
+# 添加项目路径以导入本地模块
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+if CURRENT_DIR not in sys.path:
+    sys.path.insert(0, CURRENT_DIR)
+
+from iwr1443_realtime_ecg_diffusion_gui import (  # noqa: E402
+    ECGReconstructor,
+    InferenceThread,
+    MODEL_INPUT_LENGTH,
+)
+
+from vitals_common import (  # noqa: E402
     RadarConfig,
     SerialRadarThread,
     HttpSenderThread,
@@ -28,7 +34,6 @@ from vitals_common import (
     IDX_CONF_BREATH,
     IDX_CONF_HEART,
     IDX_ENERGY_BREATH,
-    IDX_ENERGY_HEART,
     IDX_MOTION,
 )
 
@@ -36,13 +41,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QLabel, QGroupBox, QGridLayout)
 from PyQt6.QtCore import QThread, pyqtSignal, QTimer, Qt
 import pyqtgraph as pg
-
 PLOT_DISPLAY_LENGTH = 128
-
-# 串口版本的数据读取与解析：
-# - CLI 串口：115200bps，下发 cfg / sensorStart
-# - Data 串口：921600bps，持续读取二进制帧
-# - 帧内解析方式同 UDP 版本：固定偏移读取 DebugData + RangeProfile
 
 # --- 后端配置 ---
 BACKEND_URL = "http://10.29.211.136:8080/api/ti6843/vital/data/data"
@@ -124,7 +123,7 @@ class DataSenderThread(QThread):
         self.wait()
 
 
-# 兼容旧名字
+# 兼容旧名字：本脚本原本使用 DataSenderThread/RadarThread
 DataSenderThread = HttpSenderThread
 RadarThread = SerialRadarThread
 
@@ -139,6 +138,17 @@ class VitalSignsGUI(QMainWindow):
         if not self.cfg.valid: return
 
         self.init_ui()
+
+        # ECG Inference Setup
+        model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints", "diffusion_model_final_128_0109.pth")
+        self.ecg_reconstructor = ECGReconstructor(model_path, device='cuda', ddim_steps=20)
+        self.inference_thread = InferenceThread(self.ecg_reconstructor)
+        self.inference_thread.inference_done.connect(self.update_ecg_plot)
+        self.inference_thread.start()
+
+        self.inference_data_buf = deque(maxlen=MODEL_INPUT_LENGTH)
+        self.inference_new_points = 0
+        self.slide_step = 64
 
         # Buffers
         self.breath_buf = np.zeros(PLOT_DISPLAY_LENGTH)
@@ -209,6 +219,12 @@ class VitalSignsGUI(QMainWindow):
         p4.setYRange(0, 150000)
         p4.setMouseEnabled(x=False, y=False)
 
+        p5 = self.win.addPlot(title="Reconstructed ECG (Diffusion)", row=2, col=0, colspan=2)
+        p5.showGrid(x=True, y=True)
+        self.curve_ecg = p5.plot(pen=pg.mkPen('r', width=2))
+        # p5.setYRange(-2, 2) # Adjust based on normalized ECG range
+        p5.setMouseEnabled(x=False, y=False)
+
     def update_data(self, data):
         stats = data['stats']
         val_phase = stats[IDX_PHASE]
@@ -218,6 +234,16 @@ class VitalSignsGUI(QMainWindow):
         conf_breath_curr = stats[IDX_CONF_BREATH]
         energy_breath = stats[IDX_ENERGY_BREATH]
         motion_flag = stats[IDX_MOTION]
+        
+        # Accumulate data for inference
+        self.inference_data_buf.append(val_breath)
+        self.inference_new_points += 1
+        
+        if len(self.inference_data_buf) >= MODEL_INPUT_LENGTH and self.inference_new_points >= self.slide_step:
+            if hasattr(self, 'inference_thread'):
+                chunk = np.array(list(self.inference_data_buf))
+                self.inference_thread.add_data(chunk, self.slide_step)
+                self.inference_new_points = 0
 
         # Smooth
         alpha = 0.5
@@ -319,9 +345,14 @@ class VitalSignsGUI(QMainWindow):
 
         self.sender_thread.add_data(payload_obj)
 
+    def update_ecg_plot(self, ecg_data, latency, step):
+        self.curve_ecg.setData(ecg_data)
+
     def closeEvent(self, event):
         if self.thread:
             self.thread.stop()
+        if self.inference_thread:
+            self.inference_thread.stop()
         if self.sender_thread:
             self.sender_thread.stop()
         event.accept()
